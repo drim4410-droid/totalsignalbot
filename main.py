@@ -1,5 +1,4 @@
-BOT_VERSION = "BINGX_TOP200_PRO__v1__2026-02-23"
-print("BOT VERSION:", BOT_VERSION)
+print("🔥🔥🔥 NEW VERSION LOADED 🔥🔥🔥")
 import os
 import asyncio
 import logging
