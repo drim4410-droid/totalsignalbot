@@ -11,8 +11,13 @@ from dotenv import load_dotenv
 
 import ccxt.async_support as ccxt
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
 
 # -----------------------
 # LOGGING
@@ -34,17 +39,19 @@ if not BOT_TOKEN:
 
 EXCHANGE_NAME = os.getenv("EXCHANGE", "bingx").strip().lower()
 
-SCAN_EVERY_SEC = int(os.getenv("SCAN_EVERY_SEC", "300"))          # tick frequency
-ROTATION_BATCH = int(os.getenv("ROTATION_BATCH", "120"))          # how many symbols per tick to prefilter
-CANDIDATES_TOP = int(os.getenv("CANDIDATES_TOP", "20"))           # deep analyze top N
-MAX_SIGNALS_PER_TICK = int(os.getenv("MAX_SIGNALS_PER_TICK", "1"))
+# scan mechanics
+SCAN_EVERY_SEC_DEFAULT = int(os.getenv("SCAN_EVERY_SEC", "300"))      # tick frequency
+ROTATION_BATCH_DEFAULT = int(os.getenv("ROTATION_BATCH", "120"))      # symbols per tick (prefilter)
+CANDIDATES_TOP_DEFAULT = int(os.getenv("CANDIDATES_TOP", "20"))       # deep analyze top N
+MAX_SIGNALS_PER_TICK_DEFAULT = int(os.getenv("MAX_SIGNALS_PER_TICK", "1"))
 
-COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "180"))
-COOLDOWN_SEC = COOLDOWN_MIN * 60
+COOLDOWN_MIN_DEFAULT = int(os.getenv("COOLDOWN_MIN", "180"))
+COOLDOWN_SEC_DEFAULT = COOLDOWN_MIN_DEFAULT * 60
 
-MIN_ATR_PCT_15M = float(os.getenv("MIN_ATR_PCT_15M", "0.55"))     # volatility filter on 15m
-MIN_ADX_15M = float(os.getenv("MIN_ADX_15M", "16"))
-MIN_ADX_1H = float(os.getenv("MIN_ADX_1H", "18"))
+# quality thresholds (balanced by default)
+MIN_ATR_PCT_15M_DEFAULT = float(os.getenv("MIN_ATR_PCT_15M", "0.55"))
+MIN_ADX_15M_DEFAULT = float(os.getenv("MIN_ADX_15M", "16"))
+MIN_ADX_1H_DEFAULT = float(os.getenv("MIN_ADX_1H", "18"))
 
 # Strategy parameters
 EMA_FAST = 50
@@ -69,11 +76,83 @@ SEM = asyncio.Semaphore(MAX_CONCURRENCY)
 # STATE
 # -----------------------
 SUBSCRIBERS: set[int] = set()
-UNIVERSE: List[str] = []              # all USDT linear swaps
+UNIVERSE: List[str] = []
 ROT_IDX: int = 0
 
-LAST_SENT: Dict[Tuple[str, str], float] = {}   # (symbol, direction) -> ts
-PENDING_BREAK: Dict[str, Dict] = {}            # symbol -> pending breakout state
+# anti-spam
+LAST_SENT_TS: Dict[Tuple[str, str], float] = {}   # (symbol, direction) -> ts
+LAST_SENT_ENTRY: Dict[Tuple[str, str], float] = {}  # (symbol, direction) -> entry
+
+# per-chat settings (in-memory)
+CHAT_CFG: Dict[int, dict] = {}
+
+def cfg(chat_id: int) -> dict:
+    if chat_id not in CHAT_CFG:
+        CHAT_CFG[chat_id] = {
+            "autoscan": True,
+            "scan_every_sec": SCAN_EVERY_SEC_DEFAULT,
+            "rotation_batch": ROTATION_BATCH_DEFAULT,
+            "candidates_top": CANDIDATES_TOP_DEFAULT,
+            "max_signals_per_tick": MAX_SIGNALS_PER_TICK_DEFAULT,
+            "cooldown_sec": COOLDOWN_SEC_DEFAULT,
+            "min_atr_pct_15m": MIN_ATR_PCT_15M_DEFAULT,
+            "min_adx_15m": MIN_ADX_15M_DEFAULT,
+            "min_adx_1h": MIN_ADX_1H_DEFAULT,
+            "mode": "BALANCED",  # STRICT / BALANCED / MORE
+        }
+    return CHAT_CFG[chat_id]
+
+# -----------------------
+# UI
+# -----------------------
+def kb_main(chat_id: int) -> InlineKeyboardMarkup:
+    c = cfg(chat_id)
+    autos = "ON ✅" if c["autoscan"] else "OFF ⛔"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Скан сейчас", callback_data="scan_now")],
+        [InlineKeyboardButton("📌 Статус", callback_data="status"),
+         InlineKeyboardButton("🧺 Universe", callback_data="universe")],
+        [InlineKeyboardButton(f"⏯ Автоскан: {autos}", callback_data="toggle_autoscan")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton("❌ Отключить в этом чате", callback_data="off")],
+    ])
+
+def kb_settings(chat_id: int) -> InlineKeyboardMarkup:
+    c = cfg(chat_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🎯 Режим: {c['mode']}", callback_data="mode")],
+        [InlineKeyboardButton(f"⏱ Интервал: {int(c['scan_every_sec']/60)}м", callback_data="interval")],
+        [InlineKeyboardButton(f"🧪 Порог ATR%15m: {c['min_atr_pct_15m']}", callback_data="atr")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+    ])
+
+def kb_pick_mode() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔥 STRICT (чище, реже)", callback_data="set_mode:STRICT")],
+        [InlineKeyboardButton("✅ BALANCED (рекоменд)", callback_data="set_mode:BALANCED")],
+        [InlineKeyboardButton("⚡ MORE (чаще)", callback_data="set_mode:MORE")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="settings")],
+    ])
+
+def kb_pick_interval(chat_id: int) -> InlineKeyboardMarkup:
+    # seconds
+    options = [180, 300, 600, 900]  # 3m, 5m, 10m, 15m
+    rows = [[InlineKeyboardButton(f"{int(x/60)} мин", callback_data=f"set_interval:{x}") for x in options[:2]],
+            [InlineKeyboardButton(f"{int(x/60)} мин", callback_data=f"set_interval:{x}") for x in options[2:]]]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_pick_atr() -> InlineKeyboardMarkup:
+    # min atr% 15m
+    options = [0.40, 0.55, 0.70, 0.90]
+    rows = [
+        [InlineKeyboardButton(f"{options[0]}", callback_data=f"set_atr:{options[0]}"),
+         InlineKeyboardButton(f"{options[1]}", callback_data=f"set_atr:{options[1]}")],
+        [InlineKeyboardButton(f"{options[2]}", callback_data=f"set_atr:{options[2]}"),
+         InlineKeyboardButton(f"{options[3]}", callback_data=f"set_atr:{options[3]}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="settings")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 # -----------------------
 # INDICATORS
@@ -162,53 +241,46 @@ async def get_exchange():
     return ex
 
 async def build_universe(ex) -> List[str]:
-    # load markets and filter: swap + linear + quote USDT
     markets = await ex.load_markets()
     out = []
     for sym, m in markets.items():
         try:
             if not m.get("swap"):
                 continue
-            # linear swaps are USDT-margined; in ccxt often m["linear"] True
             if m.get("linear") is not True:
                 continue
             if (m.get("quote") or "") != "USDT":
                 continue
-            # avoid expiring futures
             if m.get("future"):
                 continue
             out.append(sym)
         except Exception:
             continue
-    out = sorted(set(out))
-    return out
+    return sorted(set(out))
 
 # -----------------------
-# STRATEGY CORE (MTF)
+# STRATEGY
 # -----------------------
-def trend_bias(df_4h: pd.DataFrame, df_1h: pd.DataFrame) -> Optional[str]:
-    # 4h regime: price vs EMA200
+def trend_bias(df_4h: pd.DataFrame, df_1h: pd.DataFrame, min_adx_1h: float) -> Optional[str]:
     c4 = df_4h["close"]
     e200_4 = ema(c4, EMA_SLOW).iloc[-1]
     close4 = c4.iloc[-1]
     atr4 = atr(df_4h, ATR_LEN).iloc[-1]
     if pd.isna(e200_4) or pd.isna(atr4):
         return None
-    # avoid "stuck near EMA200"
     if abs(close4 - e200_4) < 0.30 * atr4:
         return None
     regime = "LONG" if close4 > e200_4 else "SHORT" if close4 < e200_4 else None
     if regime is None:
         return None
 
-    # 1h confirm: EMA50 vs EMA200 + ADX
     c1 = df_1h["close"]
     e50_1 = ema(c1, EMA_FAST).iloc[-1]
     e200_1 = ema(c1, EMA_SLOW).iloc[-1]
     adx1 = adx(df_1h, ADX_LEN).iloc[-1]
     if pd.isna(e50_1) or pd.isna(e200_1) or pd.isna(adx1):
         return None
-    if adx1 < MIN_ADX_1H:
+    if float(adx1) < float(min_adx_1h):
         return None
 
     if regime == "LONG" and (e50_1 > e200_1):
@@ -217,7 +289,7 @@ def trend_bias(df_4h: pd.DataFrame, df_1h: pd.DataFrame) -> Optional[str]:
         return "SHORT"
     return None
 
-def level_from_15m(df_15m: pd.DataFrame, bias: str) -> Optional[float]:
+def level_from_15m(df_15m: pd.DataFrame, bias: str, min_atr_pct_15m: float, min_adx_15m: float) -> Optional[float]:
     if len(df_15m) < LEVEL_LOOKBACK_15M + 5:
         return None
 
@@ -228,26 +300,23 @@ def level_from_15m(df_15m: pd.DataFrame, bias: str) -> Optional[float]:
 
     last = df.iloc[-1]
     atr15 = last["atr"]
-    if pd.isna(atr15) or atr15 <= 0:
+    if pd.isna(atr15) or float(atr15) <= 0:
         return None
 
     atr_pct = float(atr15 / last["close"] * 100.0)
-    if atr_pct < MIN_ATR_PCT_15M:
+    if atr_pct < float(min_atr_pct_15m):
         return None
 
-    if pd.isna(last["adx"]) or float(last["adx"]) < MIN_ADX_15M:
+    if pd.isna(last["adx"]) or float(last["adx"]) < float(min_adx_15m):
         return None
 
-    # "impulse candle" filter: body >= 0.35 ATR
     body = abs(float(last["close"] - last["open"]))
     if body < 0.35 * float(atr15):
         return None
 
-    # choose breakout level
     window = df.iloc[-(LEVEL_LOOKBACK_15M + 1):-1]
     if bias == "LONG":
         level = float(window["high"].max())
-        # avoid "overheated" RSI on 15m
         if float(last["rsi"]) > 78:
             return None
         return level
@@ -258,11 +327,6 @@ def level_from_15m(df_15m: pd.DataFrame, bias: str) -> Optional[float]:
         return level
 
 def check_break_and_retest_5m(df_5m: pd.DataFrame, bias: str, level: float) -> Optional[Tuple[float, float, float, float]]:
-    """
-    Returns (entry, sl, tp1, tp2) when:
-    - breakout confirm happened (close beyond level +/- 0.10*ATR)
-    - then retest in zone within RETEST_MAX_BARS_5M and rebound candle
-    """
     if len(df_5m) < 120:
         return None
 
@@ -270,28 +334,18 @@ def check_break_and_retest_5m(df_5m: pd.DataFrame, bias: str, level: float) -> O
     df["atr"] = atr(df, ATR_LEN)
     df["ema20"] = ema(df["close"], 20)
 
-    # use last ATR(5m)
     atr5 = float(df["atr"].iloc[-1]) if pd.notna(df["atr"].iloc[-1]) else 0.0
     if atr5 <= 0:
         return None
-
-    closes = df["close"].values
-    opens = df["open"].values
-    highs = df["high"].values
-    lows = df["low"].values
     ema20_last = float(df["ema20"].iloc[-1])
 
-    # scan last N bars for breakout then retest
-    n = RETEST_MAX_BARS_5M
-    bars = df.iloc[-(n + 4):].reset_index(drop=True)  # small slice
-    if len(bars) < n + 2:
+    bars = df.iloc[-(RETEST_MAX_BARS_5M + 8):].reset_index(drop=True)
+    if len(bars) < RETEST_MAX_BARS_5M + 3:
         return None
 
-    # identify first breakout bar in slice
     level_off = BREAK_ATR_K * atr5
     retest_off = RETEST_ATR_K * atr5
 
-    # We want: breakout happened earlier, retest later.
     breakout_idx = None
     for i in range(0, len(bars)):
         c = float(bars["close"].iloc[i])
@@ -303,18 +357,15 @@ def check_break_and_retest_5m(df_5m: pd.DataFrame, bias: str, level: float) -> O
             if c < level - level_off:
                 breakout_idx = i
                 break
-
     if breakout_idx is None:
         return None
 
-    # After breakout: look for retest within next n bars
-    # Retest candle: touches zone and closes back in correct side + rebound candle quality
-    for j in range(breakout_idx + 1, min(breakout_idx + 1 + n, len(bars))):
+    # retest + rebound
+    for j in range(breakout_idx + 1, min(breakout_idx + 1 + RETEST_MAX_BARS_5M, len(bars))):
         o = float(bars["open"].iloc[j])
         c = float(bars["close"].iloc[j])
         h = float(bars["high"].iloc[j])
         l = float(bars["low"].iloc[j])
-
         body = abs(c - o)
 
         if bias == "LONG":
@@ -350,18 +401,22 @@ class Signal:
     tp2: float
     level: float
 
-def cooldown_ok(symbol: str, direction: str) -> bool:
-    t = LAST_SENT.get((symbol, direction), 0.0)
-    return (time.time() - t) >= COOLDOWN_SEC
+def cooldown_ok(chat_id: int, symbol: str, direction: str) -> bool:
+    c = cfg(chat_id)
+    t = LAST_SENT_TS.get((symbol, direction), 0.0)
+    return (time.time() - t) >= float(c["cooldown_sec"])
+
+def anti_duplicate(symbol: str, direction: str, entry: float) -> bool:
+    prev = LAST_SENT_ENTRY.get((symbol, direction))
+    if prev is None:
+        return True
+    # if entry is within 0.2% => treat as duplicate
+    return abs(prev - entry) / max(entry, 1e-9) > 0.002
 
 # -----------------------
 # SCAN PIPELINE
 # -----------------------
-async def prefilter_symbol(ex, symbol: str) -> Optional[Tuple[str, float]]:
-    """
-    Cheap prefilter: 15m ATR% + 15m volume sum
-    returns (symbol, score) where score ranks candidates
-    """
+async def prefilter_symbol(ex, symbol: str, min_atr_pct_15m: float) -> Optional[Tuple[str, float]]:
     df15 = await fetch_df(ex, symbol, "15m", 220)
     if df15 is None:
         return None
@@ -371,15 +426,13 @@ async def prefilter_symbol(ex, symbol: str) -> Optional[Tuple[str, float]]:
         return None
     close = float(df15["close"].iloc[-1])
     atr_pct = float(atr15 / close * 100.0)
-    if atr_pct < MIN_ATR_PCT_15M:
+    if atr_pct < float(min_atr_pct_15m):
         return None
-    vol = float(df15["volume"].iloc[-96:].sum())  # ~24h on 15m
-    # rank by volatility + liquidity proxy
+    vol = float(df15["volume"].iloc[-96:].sum())
     score = atr_pct * 2.0 + np.log10(max(1.0, vol)) * 0.8
     return (symbol, float(score))
 
-async def deep_analyze(ex, symbol: str) -> Optional[Signal]:
-    # Fetch higher TFs
+async def deep_analyze(ex, symbol: str, c: dict) -> Optional[Signal]:
     df4 = await fetch_df(ex, symbol, "4h", 260)
     df1 = await fetch_df(ex, symbol, "1h", 260)
     df15 = await fetch_df(ex, symbol, "15m", 260)
@@ -387,11 +440,11 @@ async def deep_analyze(ex, symbol: str) -> Optional[Signal]:
     if any(x is None for x in (df4, df1, df15, df5)):
         return None
 
-    bias = trend_bias(df4, df1)
+    bias = trend_bias(df4, df1, c["min_adx_1h"])
     if bias is None:
         return None
 
-    level = level_from_15m(df15, bias)
+    level = level_from_15m(df15, bias, c["min_atr_pct_15m"], c["min_adx_15m"])
     if level is None:
         return None
 
@@ -401,55 +454,53 @@ async def deep_analyze(ex, symbol: str) -> Optional[Signal]:
 
     entry, sl, tp1, tp2 = res
 
-    # final cooldown gate
-    if not cooldown_ok(symbol, bias):
-        return None
+    return Signal(symbol=symbol, direction=bias, entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), level=float(level))
 
-    return Signal(
-        symbol=symbol,
-        direction=bias,
-        entry=float(entry),
-        sl=float(sl),
-        tp1=float(tp1),
-        tp2=float(tp2),
-        level=float(level),
-    )
-
-async def scan_tick(app: Application):
+async def scan_tick(app: Application, forced_chat_id: Optional[int] = None):
+    """
+    If forced_chat_id is provided -> uses that chat settings and sends results only there.
+    Otherwise -> sends to all subscribers using their own settings, but scanning happens once
+    using a "global" balanced config to save API calls.
+    """
     global ROT_IDX
-
     ex = app.bot_data.get("exchange")
-    if ex is None:
-        return
-    if not UNIVERSE:
+    if ex is None or not UNIVERSE:
         return
 
-    # rotation slice
+    # choose a global scan config (use default-ish) to avoid doing different scans per chat
+    # (per-chat thresholds still apply at send stage)
+    global_cfg = {
+        "rotation_batch": ROTATION_BATCH_DEFAULT,
+        "candidates_top": CANDIDATES_TOP_DEFAULT,
+        "min_atr_pct_15m": MIN_ATR_PCT_15M_DEFAULT,
+        "min_adx_15m": MIN_ADX_15M_DEFAULT,
+        "min_adx_1h": MIN_ADX_1H_DEFAULT,
+    }
+
     n = len(UNIVERSE)
     start = ROT_IDX % n
-    end = min(n, start + ROTATION_BATCH)
+    end = min(n, start + int(global_cfg["rotation_batch"]))
     batch = UNIVERSE[start:end]
     ROT_IDX = end if end < n else 0
 
-    # cheap prefilter
     pre: List[Tuple[str, float]] = []
+
     async def pf(sym: str):
-        r = await prefilter_symbol(ex, sym)
+        r = await prefilter_symbol(ex, sym, global_cfg["min_atr_pct_15m"])
         if r:
             pre.append(r)
 
     await asyncio.gather(*[pf(s) for s in batch])
-
     if not pre:
         return
 
     pre.sort(key=lambda x: x[1], reverse=True)
-    candidates = [s for s, _ in pre[:CANDIDATES_TOP]]
+    candidates = [s for s, _ in pre[: int(global_cfg["candidates_top"])]]
 
-    # deep analyze candidates
     found: List[Signal] = []
+
     async def da(sym: str):
-        sig = await deep_analyze(ex, sym)
+        sig = await deep_analyze(ex, sym, global_cfg)
         if sig:
             found.append(sig)
 
@@ -458,85 +509,215 @@ async def scan_tick(app: Application):
     if not found:
         return
 
-    # send best first (we can add scoring later)
-    found = found[:MAX_SIGNALS_PER_TICK]
+    # send top signals (global limit)
+    found = found[:MAX_SIGNALS_PER_TICK_DEFAULT]
+
+    targets = [forced_chat_id] if forced_chat_id else list(SUBSCRIBERS)
+
     for sig in found:
-        LAST_SENT[(sig.symbol, sig.direction)] = time.time()
+        for chat_id in targets:
+            if chat_id is None:
+                continue
+            c = cfg(chat_id)
+            if not cooldown_ok(chat_id, sig.symbol, sig.direction):
+                continue
+            if not anti_duplicate(sig.symbol, sig.direction, sig.entry):
+                continue
 
-        text = (
-            f"🚨 <b>{sig.symbol}</b> — <b>{sig.direction}</b>\n\n"
-            f"TF: <b>4h/1h фильтр</b> | <b>15m уровень</b> | <b>5m вход</b>\n"
-            f"Уровень (15m): <code>{fmt_price(sig.level)}</code>\n\n"
-            f"Entry: <code>{fmt_price(sig.entry)}</code>\n"
-            f"SL: <code>{fmt_price(sig.sl)}</code>\n"
-            f"TP1: <code>{fmt_price(sig.tp1)}</code>\n"
-            f"TP2: <code>{fmt_price(sig.tp2)}</code>\n\n"
-            f"Логика: подтверждение пробоя + ретест (5m).\n"
-            f"⚠️ Не финсовет."
-        )
+            LAST_SENT_TS[(sig.symbol, sig.direction)] = time.time()
+            LAST_SENT_ENTRY[(sig.symbol, sig.direction)] = sig.entry
 
-        for chat_id in list(SUBSCRIBERS):
+            text = (
+                f"🚨 <b>{sig.symbol}</b> — <b>{sig.direction}</b>\n\n"
+                f"TF: <b>4h/1h фильтр</b> | <b>15m уровень</b> | <b>5m вход</b>\n"
+                f"Уровень (15m): <code>{fmt_price(sig.level)}</code>\n\n"
+                f"Entry: <code>{fmt_price(sig.entry)}</code>\n"
+                f"SL: <code>{fmt_price(sig.sl)}</code>\n"
+                f"TP1: <code>{fmt_price(sig.tp1)}</code>\n"
+                f"TP2: <code>{fmt_price(sig.tp2)}</code>\n\n"
+                f"Логика: подтверждение пробоя + ретест (5m)\n"
+                f"⚠️ Не финсовет."
+            )
             try:
                 await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
             except Exception:
                 pass
 
+# -----------------------
+# LOOP
+# -----------------------
 async def scanner_loop(app: Application):
     await asyncio.sleep(3)
     while True:
         try:
-            await scan_tick(app)
+            # if no subscribers - just sleep
+            if not SUBSCRIBERS:
+                await asyncio.sleep(30)
+                continue
+
+            # autoscan is per chat; if at least one chat has autoscan ON, run tick
+            any_on = any(cfg(cid).get("autoscan", True) for cid in SUBSCRIBERS)
+            if any_on:
+                await scan_tick(app)
         except Exception as e:
-            log.warning("scan_tick error: %s", e)
-        await asyncio.sleep(max(30, SCAN_EVERY_SEC))
+            log.warning("scanner_loop error: %s", e)
+
+        # choose smallest interval among active chats
+        if SUBSCRIBERS:
+            intervals = [int(cfg(cid)["scan_every_sec"]) for cid in SUBSCRIBERS if cfg(cid).get("autoscan", True)]
+            sleep_s = min(intervals) if intervals else 60
+        else:
+            sleep_s = 60
+
+        await asyncio.sleep(max(30, sleep_s))
 
 # -----------------------
-# TELEGRAM COMMANDS
+# TELEGRAM HANDLERS
 # -----------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     SUBSCRIBERS.add(chat_id)
-
-    n = len(UNIVERSE)
+    cfg(chat_id)  # init
     await update.message.reply_text(
-        "✅ Готово. Ты подписан на сигналы.\n\n"
-        "Команды:\n"
-        "/status — статус\n"
-        "/now — принудительный тик скана\n"
-        "/universe — сколько USDT perpetual найдено\n"
-        "/off — отключить для этого чата\n\n"
-        "Логика: 4h/1h фильтр → 15m уровень → 5m подтверждение+ретест.\n"
-        "⚠️ Не финсовет."
+        "✅ Готово. Я включён.\n\n"
+        "Управление — кнопками ниже.",
+        reply_markup=kb_main(chat_id)
     )
-    await cmd_status(update, context)
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    c = cfg(chat_id)
+    await update.message.reply_text(
+        f"Статус ✅\n"
+        f"Exchange: {EXCHANGE_NAME}\n"
+        f"Universe: {len(UNIVERSE)}\n"
+        f"Автоскан: {'ON' if c['autoscan'] else 'OFF'}\n"
+        f"Интервал: {int(c['scan_every_sec']/60)} мин\n"
+        f"Mode: {c['mode']}\n"
+        f"ATR%15m >= {c['min_atr_pct_15m']}\n"
+        f"ADX15m >= {c['min_adx_15m']}, ADX1h >= {c['min_adx_1h']}\n"
+        f"Cooldown: {int(c['cooldown_sec']/60)} мин",
+        reply_markup=kb_main(chat_id)
+    )
+
+async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    SUBSCRIBERS.add(chat_id)
+    cfg(chat_id)
+    await update.message.reply_text("⏳ Сканирую сейчас…")
+    await scan_tick(context.application, forced_chat_id=chat_id)
+    await update.message.reply_text("✅ Готово. Если сетап был — я отправил сигнал.", reply_markup=kb_main(chat_id))
 
 async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     SUBSCRIBERS.discard(chat_id)
-    await update.message.reply_text("⛔ Ок, отключил для этого чата. Чтобы включить снова — /start")
+    await update.message.reply_text("⛔ Отключил для этого чата. Чтобы включить снова — /start")
 
 async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"USDT perpetual (linear swap) найдено: {len(UNIVERSE)}")
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"USDT perpetual (linear swap): {len(UNIVERSE)}", reply_markup=kb_main(chat_id))
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ex = context.application.bot_data.get("exchange_name", EXCHANGE_NAME)
-    await update.message.reply_text(
-        f"Статус ✅\n"
-        f"Exchange: {ex}\n"
-        f"Universe: {len(UNIVERSE)}\n"
-        f"Tick: каждые {SCAN_EVERY_SEC} сек\n"
-        f"Rotation batch: {ROTATION_BATCH}\n"
-        f"Candidates top: {CANDIDATES_TOP}\n"
-        f"Cooldown: {COOLDOWN_MIN} мин\n"
-        f"ATR%15m >= {MIN_ATR_PCT_15M}\n"
-        f"ADX15m >= {MIN_ADX_15M}, ADX1h >= {MIN_ADX_1H}\n"
-        f"Подписчиков: {len(SUBSCRIBERS)}"
-    )
+async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    chat_id = q.message.chat_id
+    c = cfg(chat_id)
 
-async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Запускаю тик скана…")
-    await scan_tick(context.application)
-    await update.message.reply_text("✅ Готово. Если сетап был — я отправил сигнал.")
+    data = q.data
+
+    if data == "back":
+        await q.message.edit_text("Меню:", reply_markup=kb_main(chat_id))
+        return
+
+    if data == "status":
+        await q.message.edit_text(
+            f"📌 <b>Status</b>\n\n"
+            f"Exchange: <code>{EXCHANGE_NAME}</code>\n"
+            f"Universe: <code>{len(UNIVERSE)}</code>\n"
+            f"Автоскан: <b>{'ON' if c['autoscan'] else 'OFF'}</b>\n"
+            f"Интервал: <b>{int(c['scan_every_sec']/60)} мин</b>\n"
+            f"Mode: <b>{c['mode']}</b>\n"
+            f"ATR%15m >= <b>{c['min_atr_pct_15m']}</b>\n"
+            f"ADX15m >= <b>{c['min_adx_15m']}</b>, ADX1h >= <b>{c['min_adx_1h']}</b>\n"
+            f"Cooldown: <b>{int(c['cooldown_sec']/60)} мин</b>",
+            parse_mode="HTML",
+            reply_markup=kb_main(chat_id)
+        )
+        return
+
+    if data == "universe":
+        await q.message.edit_text(f"🧺 Universe: <b>{len(UNIVERSE)}</b> USDT perpetual (linear).", parse_mode="HTML", reply_markup=kb_main(chat_id))
+        return
+
+    if data == "scan_now":
+        await q.message.reply_text("⏳ Сканирую сейчас…")
+        await scan_tick(context.application, forced_chat_id=chat_id)
+        await q.message.reply_text("✅ Готово.", reply_markup=kb_main(chat_id))
+        return
+
+    if data == "toggle_autoscan":
+        c["autoscan"] = not bool(c["autoscan"])
+        await q.message.edit_text("Меню:", reply_markup=kb_main(chat_id))
+        return
+
+    if data == "settings":
+        await q.message.edit_text("⚙️ <b>Настройки</b>", parse_mode="HTML", reply_markup=kb_settings(chat_id))
+        return
+
+    if data == "mode":
+        await q.message.edit_text("🎯 Выбери режим:", reply_markup=kb_pick_mode())
+        return
+
+    if data.startswith("set_mode:"):
+        mode = data.split(":", 1)[1]
+        c["mode"] = mode
+
+        # Apply presets
+        if mode == "STRICT":
+            c["min_atr_pct_15m"] = 0.70
+            c["min_adx_1h"] = 20
+            c["min_adx_15m"] = 18
+            c["cooldown_sec"] = 240 * 60
+            c["scan_every_sec"] = max(c["scan_every_sec"], 600)
+        elif mode == "MORE":
+            c["min_atr_pct_15m"] = 0.40
+            c["min_adx_1h"] = 16
+            c["min_adx_15m"] = 14
+            c["cooldown_sec"] = 120 * 60
+            c["scan_every_sec"] = min(c["scan_every_sec"], 300)
+        else:  # BALANCED
+            c["min_atr_pct_15m"] = 0.55
+            c["min_adx_1h"] = 18
+            c["min_adx_15m"] = 16
+            c["cooldown_sec"] = 180 * 60
+
+        await q.message.edit_text("✅ Режим применён.", reply_markup=kb_settings(chat_id))
+        return
+
+    if data == "interval":
+        await q.message.edit_text("⏱ Выбери интервал:", reply_markup=kb_pick_interval(chat_id))
+        return
+
+    if data.startswith("set_interval:"):
+        sec = int(data.split(":", 1)[1])
+        c["scan_every_sec"] = sec
+        await q.message.edit_text("✅ Интервал обновлён.", reply_markup=kb_settings(chat_id))
+        return
+
+    if data == "atr":
+        await q.message.edit_text("🧪 Порог ATR%15m:", reply_markup=kb_pick_atr())
+        return
+
+    if data.startswith("set_atr:"):
+        val = float(data.split(":", 1)[1])
+        c["min_atr_pct_15m"] = val
+        await q.message.edit_text("✅ ATR% порог обновлён.", reply_markup=kb_settings(chat_id))
+        return
+
+    if data == "off":
+        SUBSCRIBERS.discard(chat_id)
+        await q.message.edit_text("⛔ Отключил для этого чата. Чтобы включить снова — /start")
+        return
 
 # -----------------------
 # STARTUP / SHUTDOWN
@@ -544,11 +725,9 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_startup(app: Application):
     ex = await get_exchange()
     app.bot_data["exchange"] = ex
-    app.bot_data["exchange_name"] = EXCHANGE_NAME
 
-    uni = await build_universe(ex)
     global UNIVERSE
-    UNIVERSE = uni
+    UNIVERSE = await build_universe(ex)
 
     log.info("Universe built: %s symbols", len(UNIVERSE))
     asyncio.create_task(scanner_loop(app))
@@ -569,9 +748,10 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("universe", cmd_universe))
     app.add_handler(CommandHandler("now", cmd_now))
+    app.add_handler(CommandHandler("universe", cmd_universe))
     app.add_handler(CommandHandler("off", cmd_off))
+    app.add_handler(CallbackQueryHandler(cb))
 
     app.post_init = on_startup
     app.post_shutdown = on_shutdown
