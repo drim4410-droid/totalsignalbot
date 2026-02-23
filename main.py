@@ -1,3 +1,4 @@
+print("### NEW PRO BOT VERSION LOADED ###", flush=True)
 import os
 import asyncio
 import logging
